@@ -1,4 +1,5 @@
 from collections import OrderedDict
+import copy
 import os
 import sqlite3
 import asyncio
@@ -8,6 +9,9 @@ from typing import Literal, Optional
 import threading
 import time
 import signal
+from toolkit.metadata import get_meta_for_safetensors
+from toolkit.train_tools import get_torch_dtype
+from extensions_built_in.sd_trainer.aitk_db import enqueue_sample_task, count_open_sample_tasks
 
 AITK_Status = Literal["running", "stopped", "error", "completed"]
 
@@ -18,6 +22,10 @@ class DiffusionTrainer(SDTrainer):
         self.sqlite_db_path = self.config.get("sqlite_db_path", "./aitk_db.db")
         self.job_id = os.environ.get("AITK_JOB_ID", None)
         self.job_id = self.job_id.strip() if self.job_id is not None else None
+        self.attempt_id = os.environ.get("AITK_ATTEMPT_ID", None)
+        self.attempt_id = self.attempt_id.strip() if self.attempt_id is not None else None
+        self.use_dedicated_sampler = os.environ.get("AITK_USE_DEDICATED_SAMPLER", "0") == "1"
+        self.sample_snapshot_dir = os.path.join(self.save_root, "sample_snapshots")
         self.is_ui_trainer = True
         if not os.path.exists(self.sqlite_db_path):
             self.is_ui_trainer = False
@@ -38,6 +46,9 @@ class DiffusionTrainer(SDTrainer):
             self._run_async_operation(self._update_status("running", "Starting"))
             self._stop_watcher_started = False
             # self.start_stop_watcher(interval_sec=2.0)
+
+    def uses_dedicated_sampler(self):
+        return self.is_ui_trainer and self.use_dedicated_sampler and self.attempt_id is not None
     
     def start_stop_watcher(self, interval_sec: float = 5.0):
         """
@@ -196,6 +207,28 @@ class DiffusionTrainer(SDTrainer):
 
         await self._execute_db_operation(_do_update)
 
+    async def _touch_attempt_heartbeat(self):
+        if not self.accelerator.is_main_process or not self.is_ui_trainer or self.attempt_id is None:
+            return
+
+        def _do_update():
+            with self._db_connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute("BEGIN IMMEDIATE")
+                try:
+                    cursor.execute(
+                        "UPDATE JobRunAttempt SET heartbeat_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (self.attempt_id,),
+                    )
+                finally:
+                    cursor.execute("COMMIT")
+
+        await self._execute_db_operation(_do_update)
+
+    def touch_attempt_heartbeat(self):
+        if self.accelerator.is_main_process and self.is_ui_trainer and self.attempt_id is not None:
+            self._run_async_operation(self._touch_attempt_heartbeat())
+
     def update_step(self):
         """Non-blocking update of the step count."""
         if self.accelerator.is_main_process and self.is_ui_trainer:
@@ -277,7 +310,12 @@ class DiffusionTrainer(SDTrainer):
     def done_hook(self):
         super(DiffusionTrainer, self).done_hook()
         if self.is_ui_trainer:
-            self.update_status("completed", "Training completed")
+            if self.uses_dedicated_sampler():
+                open_tasks = count_open_sample_tasks(self.sqlite_db_path, self.attempt_id)
+                info = "Training completed, waiting for dedicated sampler" if open_tasks > 0 else "Training completed"
+                self.update_status("completed", info)
+            else:
+                self.update_status("completed", "Training completed")
             # Wait for all async operations to finish before shutting down
             asyncio.run(self.wait_for_all_async())
             self.thread_pool.shutdown(wait=True)
@@ -286,6 +324,7 @@ class DiffusionTrainer(SDTrainer):
         super(DiffusionTrainer, self).end_step_hook()
         if self.is_ui_trainer:
             self.update_step()
+            self.touch_attempt_heartbeat()
             self.maybe_stop()
 
     def hook_before_model_load(self):
@@ -326,6 +365,13 @@ class DiffusionTrainer(SDTrainer):
 
     def sample(self, step=None, is_first=False):
         self.maybe_stop()
+        if self.uses_dedicated_sampler():
+            self.update_status("running", "Queueing sample task")
+            self.enqueue_dedicated_sample(step=step, is_first=is_first)
+            self.touch_attempt_heartbeat()
+            self.maybe_stop()
+            self.update_status("running", "Training")
+            return
         total_imgs = len(self.sample_config.prompts)
         self.update_status("running", f"Generating images - 0/{total_imgs}")
         super().sample(step, is_first)
@@ -335,6 +381,99 @@ class DiffusionTrainer(SDTrainer):
     def save(self, step=None):
         self.maybe_stop()
         self.update_status("running", "Saving model")
-        super().save(step)
+        save_path = super().save(step)
         self.maybe_stop()
         self.update_status("running", "Training")
+        return save_path
+
+    def _get_current_lora_artifact_path(self):
+        lora_name = self.name
+        if self.named_lora:
+            lora_name = f"{lora_name}_LoRA"
+        return self.get_latest_save_path(lora_name)
+
+    def _create_sampling_snapshot(self, step: int):
+        if self.network is None:
+            return None
+
+        os.makedirs(self.sample_snapshot_dir, exist_ok=True)
+        step_num = f"_{str(step).zfill(9)}"
+        snapshot_path = os.path.join(self.sample_snapshot_dir, f"{self.job.name}_sample{step_num}.safetensors")
+
+        if self.ema is not None:
+            self.ema.eval()
+
+        self.update_training_metadata()
+        save_meta = get_meta_for_safetensors(copy.deepcopy(self.meta), self.job.name)
+        prev_multiplier = self.network.multiplier
+        self.network.multiplier = 1.0
+        self.network.save_weights(
+            snapshot_path,
+            dtype=get_torch_dtype(self.save_config.dtype),
+            metadata=save_meta,
+        )
+        self.network.multiplier = prev_multiplier
+
+        if self.ema is not None:
+            self.ema.train()
+
+        return snapshot_path
+
+    def _resolve_sampling_artifact(self, step: int):
+        if step is not None and self.last_save_step == step and self.last_save_artifact_path is not None:
+            return "checkpoint", self.last_save_artifact_path, False
+
+        current_artifact = self._get_current_lora_artifact_path()
+        if current_artifact is not None and step <= self.start_step:
+            return "checkpoint", current_artifact, False
+
+        if current_artifact is None and step <= self.start_step:
+            snapshot_path = self._create_sampling_snapshot(step)
+            return "sample_snapshot", snapshot_path, True
+
+        snapshot_path = self._create_sampling_snapshot(step)
+        return "sample_snapshot", snapshot_path, True
+
+    def _get_sample_config_raw(self, is_first: bool):
+        if is_first and self.has_first_sample_requested:
+            raw_first_sample = self.get_conf("first_sample", None)
+            if raw_first_sample is not None:
+                return copy.deepcopy(raw_first_sample)
+        return copy.deepcopy(self.get_conf("sample", {}))
+
+    def _get_sample_task_kind(self, step: int, is_first: bool):
+        if is_first:
+            return "first"
+        if step >= self.train_config.steps:
+            return "final"
+        if step <= self.start_step:
+            return "baseline"
+        return "periodic"
+
+    def enqueue_dedicated_sample(self, step=None, is_first=False):
+        if self.attempt_id is None or self.job_id is None:
+            return
+
+        resolved_step = int(step or 0)
+        task_kind = self._get_sample_task_kind(resolved_step, is_first)
+        artifact_kind, artifact_path, cleanup_on_complete = self._resolve_sampling_artifact(resolved_step)
+        frozen_config = {
+            "job_name": self.job.name,
+            "save_root": self.save_root,
+            "trigger_word": self.trigger_word,
+            "task_kind": task_kind,
+            "step": resolved_step,
+            "process_config": copy.deepcopy(self.raw_process_config),
+            "sample_config": self._get_sample_config_raw(is_first=is_first),
+        }
+        enqueue_sample_task(
+            self.sqlite_db_path,
+            self.attempt_id,
+            self.job_id,
+            resolved_step,
+            task_kind,
+            artifact_kind,
+            artifact_path,
+            frozen_config,
+            cleanup_on_complete=cleanup_on_complete,
+        )

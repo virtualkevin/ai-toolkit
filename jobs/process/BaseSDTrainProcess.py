@@ -261,6 +261,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.current_boundary_index = 0
         self.steps_this_boundary = 0
         self.num_consecutive_oom = 0
+        self.last_save_artifact_path = None
 
     def post_process_generate_image_config_list(self, generate_image_config_list: List[GenerateImageConfig]):
         # override in subclass
@@ -490,7 +491,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
     def save(self, step=None):
         if not self.accelerator.is_main_process:
-            return
+            return None
         flush()
         if self.ema is not None:
             # always save params as ema
@@ -675,6 +676,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 json.dump(json_data, f, indent=4)
         
         print_acc(f"Saved checkpoint to {file_path}")
+        self.last_save_artifact_path = file_path
 
         # save optimizer
         if self.optimizer is not None:
@@ -697,6 +699,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.ema is not None:
             self.ema.train()
         flush()
+        return file_path
 
     # Called before the model is loaded
     def hook_before_model_load(self):

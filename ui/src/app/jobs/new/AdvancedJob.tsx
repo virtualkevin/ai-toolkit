@@ -14,9 +14,6 @@ type Props = {
   status: 'idle' | 'saving' | 'success' | 'error';
   handleSubmit: (event: React.FormEvent<HTMLFormElement>) => void;
   runId: string | null;
-  gpuIDs: string | null;
-  setGpuIDs: (value: string | null) => void;
-  gpuList: any;
   datasetOptions: any;
   settings: Settings;
 };

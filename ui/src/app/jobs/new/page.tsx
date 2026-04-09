@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { defaultJobConfig, defaultDatasetConfig, migrateJobConfig } from './jobConfig';
 import { jobTypeOptions } from './options';
@@ -20,6 +20,12 @@ import SimpleJob from './SimpleJob';
 import AdvancedJob from './AdvancedJob';
 import ErrorBoundary from '@/components/ErrorBoundary';
 import { apiClient } from '@/utils/api';
+import {
+  getLegacyGpuIdsFromSelection,
+  resolveJobGpuSelection,
+} from '@/utils/jobs';
+import { NO_SAMPLING_GPU_VALUE } from '@/types';
+import { isMac } from '@/helpers/basic';
 
 const isDev = process.env.NODE_ENV === 'development';
 
@@ -28,7 +34,8 @@ export default function TrainingForm() {
   const searchParams = useSearchParams();
   const runId = searchParams.get('id');
   const cloneId = searchParams.get('cloneId');
-  const [gpuIDs, setGpuIDs] = useState<string | null>(null);
+  const [trainingGpuID, setTrainingGpuID] = useState<string | null>(null);
+  const [samplingGpuID, setSamplingGpuID] = useState<string | null>(null);
   const { settings, isSettingsLoaded } = useSettings();
   const { gpuList, isGPUInfoLoaded } = useGPUInfo();
   const { datasets, status: datasetFetchStatus } = useDatasetList();
@@ -38,6 +45,30 @@ export default function TrainingForm() {
   const [jobConfig, setJobConfig] = useNestedState<JobConfig>(objectCopy(migrateJobConfig(defaultJobConfig)));
   const [status, setStatus] = useState<'idle' | 'saving' | 'success' | 'error'>('idle');
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const showGPUSelect = !isMac();
+
+  const gpuSelectOptions = useMemo(() => {
+    if (!isGPUInfoLoaded) return [];
+    return gpuList.map((gpu: any) => ({ value: `${gpu.index}`, label: `GPU #${gpu.index}` }));
+  }, [gpuList, isGPUInfoLoaded]);
+
+  const samplingGpuOptions = useMemo(() => {
+    const baseOptions = gpuSelectOptions.filter(option => option.value !== trainingGpuID);
+    return [{ value: NO_SAMPLING_GPU_VALUE, label: 'None (training only)' }, ...baseOptions];
+  }, [gpuSelectOptions, trainingGpuID]);
+
+  const handleTrainingGpuChange = (value: string | null) => {
+    setTrainingGpuID(value);
+    setSamplingGpuID(current => (current === value ? null : current));
+  };
+
+  const handleSamplingGpuChange = (value: string | null) => {
+    if (value === null || value === NO_SAMPLING_GPU_VALUE) {
+      setSamplingGpuID(null);
+      return;
+    }
+    setSamplingGpuID(value);
+  };
 
   const handleImportConfig = () => {
     fileInputRef.current?.click();
@@ -111,7 +142,9 @@ export default function TrainingForm() {
         .then(res => res.data)
         .then(data => {
           console.log('Clone Training:', data);
-          setGpuIDs(data.gpu_ids);
+          const gpuSelection = resolveJobGpuSelection(data);
+          setTrainingGpuID(gpuSelection.training_gpu_id);
+          setSamplingGpuID(gpuSelection.sampling_gpu_id);
           const newJobConfig = migrateJobConfig(JSON.parse(data.job_config));
           newJobConfig.config.name = `${newJobConfig.config.name}_copy`;
           setJobConfig(newJobConfig);
@@ -127,7 +160,9 @@ export default function TrainingForm() {
         .then(res => res.data)
         .then(data => {
           console.log('Training:', data);
-          setGpuIDs(data.gpu_ids);
+          const gpuSelection = resolveJobGpuSelection(data);
+          setTrainingGpuID(gpuSelection.training_gpu_id);
+          setSamplingGpuID(gpuSelection.sampling_gpu_id);
           setJobConfig(migrateJobConfig(JSON.parse(data.job_config)));
         })
         .catch(error => console.error('Error fetching training:', error));
@@ -136,11 +171,19 @@ export default function TrainingForm() {
 
   useEffect(() => {
     if (isGPUInfoLoaded) {
-      if (gpuIDs === null && gpuList.length > 0) {
-        setGpuIDs(`${gpuList[0].index}`);
+      if (isMac()) {
+        setTrainingGpuID(current => current ?? 'mps');
+        setSamplingGpuID(null);
+        return;
+      }
+      if (trainingGpuID === null && gpuList.length > 0) {
+        setTrainingGpuID(`${gpuList[0].index}`);
+      }
+      if (samplingGpuID === null) {
+        setSamplingGpuID(null);
       }
     }
-  }, [gpuList, isGPUInfoLoaded]);
+  }, [gpuList, isGPUInfoLoaded, trainingGpuID, samplingGpuID]);
 
   useEffect(() => {
     if (isSettingsLoaded) {
@@ -152,11 +195,21 @@ export default function TrainingForm() {
     if (status === 'saving') return;
     setStatus('saving');
 
+    const effectiveTrainingGpuID = trainingGpuID ?? (gpuList[0] ? `${gpuList[0].index}` : null);
+    if (!effectiveTrainingGpuID) {
+      setStatus('error');
+      alert('Please select a training GPU before saving the job.');
+      return;
+    }
+    const effectiveSamplingGpuID = samplingGpuID === NO_SAMPLING_GPU_VALUE ? null : samplingGpuID;
+
     apiClient
       .post('/api/jobs', {
         id: runId,
         name: jobConfig.config.name,
-        gpu_ids: gpuIDs,
+        training_gpu_id: effectiveTrainingGpuID,
+        sampling_gpu_id: effectiveSamplingGpuID,
+        gpu_ids: getLegacyGpuIdsFromSelection(effectiveTrainingGpuID, effectiveSamplingGpuID),
         job_config: jobConfig,
       })
       .then(res => {
@@ -201,13 +254,26 @@ export default function TrainingForm() {
         <div className="flex-1"></div>
         {showAdvancedView && (
           <>
-            <div>
-              <SelectInput
-                value={`${gpuIDs}`}
-                onChange={value => setGpuIDs(value)}
-                options={gpuList.map((gpu: any) => ({ value: `${gpu.index}`, label: `GPU #${gpu.index}` }))}
-              />
-            </div>
+            {showGPUSelect && (
+              <>
+                <div className="min-w-44">
+                  <SelectInput
+                    label="Training GPU"
+                    value={trainingGpuID ?? ''}
+                    onChange={handleTrainingGpuChange}
+                    options={gpuSelectOptions}
+                  />
+                </div>
+                <div className="min-w-44">
+                  <SelectInput
+                    label="Sampling GPU"
+                    value={samplingGpuID ?? NO_SAMPLING_GPU_VALUE}
+                    onChange={handleSamplingGpuChange}
+                    options={samplingGpuOptions}
+                  />
+                </div>
+              </>
+            )}
             <div className="mx-4 bg-gray-200 dark:bg-gray-800 w-1 h-6"></div>
             <div>
               <Button className="text-gray-200 bg-gray-800 px-3 py-1 rounded-md" onClick={handleImportConfig}>
@@ -285,9 +351,6 @@ export default function TrainingForm() {
             status={status}
             handleSubmit={handleSubmit}
             runId={runId}
-            gpuIDs={gpuIDs}
-            setGpuIDs={setGpuIDs}
-            gpuList={gpuList}
             datasetOptions={datasetOptions}
             settings={settings}
           />
@@ -307,8 +370,10 @@ export default function TrainingForm() {
               status={status}
               handleSubmit={handleSubmit}
               runId={runId}
-              gpuIDs={gpuIDs}
-              setGpuIDs={setGpuIDs}
+              trainingGpuID={trainingGpuID}
+              samplingGpuID={samplingGpuID}
+              setTrainingGpuID={handleTrainingGpuChange}
+              setSamplingGpuID={handleSamplingGpuChange}
               gpuList={gpuList}
               datasetOptions={datasetOptions}
               isLoading={!isSettingsLoaded || !isGPUInfoLoaded || datasetFetchStatus !== 'success'}

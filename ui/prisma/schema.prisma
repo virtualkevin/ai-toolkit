@@ -25,6 +25,8 @@ model Job {
   id              String   @id @default(uuid())
   name            String   @unique
   gpu_ids         String
+  training_gpu_id String?
+  sampling_gpu_id String?
   job_config      String // JSON string
   created_at      DateTime @default(now())
   updated_at      DateTime @updatedAt
@@ -36,7 +38,64 @@ model Job {
   speed_string    String   @default("")
   queue_position  Int      @default(0)
   pid             Int?
+  sampler_pid     Int?
+  attempts        JobRunAttempt[]
+  sample_tasks    SampleTask[]
 
   @@index([status])
   @@index([gpu_ids])
+  @@index([training_gpu_id])
+  @@index([sampling_gpu_id])
+}
+
+model JobRunAttempt {
+  id          String           @id @default(uuid())
+  job_id       String
+  status       String          @default("starting")
+  trainer_pid  Int?
+  sampler_pid  Int?
+  started_at   DateTime        @default(now())
+  finished_at  DateTime?
+  heartbeat_at DateTime?
+  job          Job             @relation(fields: [job_id], references: [id], onDelete: Cascade)
+  reservations GpuReservation[]
+  sample_tasks SampleTask[]
+
+  @@index([job_id])
+  @@index([status])
+}
+
+model GpuReservation {
+  id         Int           @id @default(autoincrement())
+  gpu_id     String        @unique
+  role       String
+  created_at DateTime      @default(now())
+  attempt_id String
+  attempt    JobRunAttempt @relation(fields: [attempt_id], references: [id], onDelete: Cascade)
+
+  @@index([attempt_id])
+}
+
+model SampleTask {
+  id             String        @id @default(uuid())
+  attempt_id     String
+  job_id         String
+  sequence       Int
+  step           Int
+  task_kind      String
+  artifact_kind  String
+  artifact_path  String?
+  frozen_config  String
+  status         String        @default("pending")
+  error          String?
+  cleanup_on_complete Boolean  @default(false)
+  created_at     DateTime      @default(now())
+  started_at     DateTime?
+  completed_at   DateTime?
+  attempt        JobRunAttempt @relation(fields: [attempt_id], references: [id], onDelete: Cascade)
+  job            Job           @relation(fields: [job_id], references: [id], onDelete: Cascade)
+
+  @@unique([attempt_id, sequence])
+  @@index([job_id])
+  @@index([attempt_id, status, sequence])
 }

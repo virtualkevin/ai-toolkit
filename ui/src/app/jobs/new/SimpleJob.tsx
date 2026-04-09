@@ -20,6 +20,7 @@ import { FlipHorizontal2, FlipVertical2 } from 'lucide-react';
 import { handleModelArchChange } from './utils';
 import { IoFlaskSharp } from 'react-icons/io5';
 import { isMac } from '@/helpers/basic';
+import { NO_SAMPLING_GPU_VALUE } from '@/types';
 
 type Props = {
   jobConfig: JobConfig;
@@ -27,8 +28,10 @@ type Props = {
   status: 'idle' | 'saving' | 'success' | 'error';
   handleSubmit: (event: React.FormEvent<HTMLFormElement>) => void;
   runId: string | null;
-  gpuIDs: string | null;
-  setGpuIDs: (value: string | null) => void;
+  trainingGpuID: string | null;
+  samplingGpuID: string | null;
+  setTrainingGpuID: (value: string | null) => void;
+  setSamplingGpuID: (value: string | null) => void;
   gpuList: any;
   datasetOptions: any;
   isLoading?: boolean;
@@ -42,8 +45,10 @@ export default function SimpleJob({
   handleSubmit,
   status,
   runId,
-  gpuIDs,
-  setGpuIDs,
+  trainingGpuID,
+  samplingGpuID,
+  setTrainingGpuID,
+  setSamplingGpuID,
   gpuList,
   datasetOptions,
   isLoading,
@@ -148,6 +153,15 @@ export default function SimpleJob({
   }, [modelArch]);
 
   const showGPUSelect = !isMac();
+  const trainingGpuOptions = useMemo(() => {
+    return gpuList.map((gpu: any) => ({ value: `${gpu.index}`, label: `GPU #${gpu.index}` }));
+  }, [gpuList]);
+  const samplingGpuOptions = useMemo(() => {
+    return [
+      { value: NO_SAMPLING_GPU_VALUE, label: 'None (training only)' },
+      ...trainingGpuOptions.filter((option: SelectOption) => option.value !== trainingGpuID),
+    ];
+  }, [trainingGpuOptions, trainingGpuID]);
 
   return (
     <>
@@ -175,13 +189,33 @@ export default function SimpleJob({
               required
             />
             {showGPUSelect && (
-              <SelectInput
-                label="GPU ID"
-                value={`${gpuIDs}`}
-                docKey="gpuids"
-                onChange={value => setGpuIDs(value)}
-                options={gpuList.map((gpu: any) => ({ value: `${gpu.index}`, label: `GPU #${gpu.index}` }))}
-              />
+              <>
+                <SelectInput
+                  label="Training GPU"
+                  value={trainingGpuID ?? ''}
+                  docKey="gpuids"
+                  onChange={value => {
+                    setTrainingGpuID(value);
+                    if (samplingGpuID === value) {
+                      setSamplingGpuID(null);
+                    }
+                  }}
+                  options={trainingGpuOptions}
+                />
+                <SelectInput
+                  label="Sampling GPU"
+                  value={samplingGpuID ?? NO_SAMPLING_GPU_VALUE}
+                  docKey="gpuids"
+                  onChange={value => {
+                    if (value === NO_SAMPLING_GPU_VALUE) {
+                      setSamplingGpuID(null);
+                      return;
+                    }
+                    setSamplingGpuID(value);
+                  }}
+                  options={samplingGpuOptions}
+                />
+              </>
             )}
             {disableSections.includes('trigger_word') ? null : (
               <TextInput

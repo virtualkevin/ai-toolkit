@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { PrismaClient } from '@prisma/client';
+import { resolveGpuAssignment } from '@/server/jobGpu';
 
 const prisma = new PrismaClient();
 
@@ -14,7 +15,6 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
     return NextResponse.json({ error: 'Job not found' }, { status: 404 });
   }
 
-  // get highest queue position
   const highestQueuePosition = await prisma.job.aggregate({
     _max: {
       queue_position: true,
@@ -27,18 +27,18 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
     data: { queue_position: newQueuePosition },
   });
 
-  // make sure the queue is running
+  const assignment = resolveGpuAssignment(job);
+
   const queue = await prisma.queue.findFirst({
     where: {
-      gpu_ids: job.gpu_ids,
+      gpu_ids: assignment.queueKey,
     },
   });
 
-  // if queue doesn't exist, create it
   if (!queue) {
     await prisma.queue.create({
       data: {
-        gpu_ids: job.gpu_ids,
+        gpu_ids: assignment.queueKey,
         is_running: false,
       },
     });
@@ -54,6 +54,8 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
     },
   });
 
-  // Return the response immediately
-  return NextResponse.json(job);
+  return NextResponse.json({
+    ...job,
+    queue_key: assignment.queueKey,
+  });
 }
