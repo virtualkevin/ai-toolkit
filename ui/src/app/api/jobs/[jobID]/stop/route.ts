@@ -4,6 +4,21 @@ import { PrismaClient } from '@prisma/client';
 const prisma = new PrismaClient();
 const isWindows = process.platform === 'win32';
 
+const stopPid = (pid: number | null | undefined) => {
+  if (pid == null) return;
+
+  try {
+    if (isWindows) {
+      const { execSync } = require('child_process');
+      execSync(`taskkill /PID ${pid} /T /F`, { stdio: 'ignore' });
+    } else {
+      process.kill(pid, 'SIGINT');
+    }
+  } catch (error) {
+    console.error(`Error sending stop signal to PID ${pid}:`, error);
+  }
+};
+
 export async function GET(request: NextRequest, { params }: { params: { jobID: string } }) {
   const { jobID } = await params;
 
@@ -15,41 +30,37 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
     return NextResponse.json({ error: 'Job not found' }, { status: 404 });
   }
 
+  const activeAttempt = await prisma.jobRunAttempt.findFirst({
+    where: {
+      job_id: jobID,
+      status: { in: ['starting', 'running', 'stopping'] },
+    },
+    orderBy: {
+      started_at: 'desc',
+    },
+  });
+
   await prisma.job.update({
     where: { id: jobID },
     data: {
       stop: true,
+      return_to_queue: false,
+      status: 'stopping',
       info: 'Stopping job...',
     },
   });
 
-  // Send SIGINT to the process if we have a PID
-  if (job.pid != null) {
-    console.log(`Attempting to stop job ${jobID} with PID ${job.pid}`);
-    try {
-      if (isWindows) {
-        // Windows doesn't support SIGINT for arbitrary processes.
-        // Use taskkill with /T (tree) to send a CTRL+C-like termination.
-        const { execSync } = require('child_process');
-        execSync(`taskkill /PID ${job.pid} /T /F`, { stdio: 'ignore' });
-      } else {
-        process.kill(job.pid, 'SIGINT');
-      }
-      // if it killed it, mark it stopped in the database
-      await prisma.job.update({
-        where: { id: jobID },
-        data: {
-          status: 'stopped',
-          info: 'Job stopped',
-        },
-      });
-    } catch (e) {
-      // Process may have already exited — that's fine
-      console.error('Error sending signal to process:', e);
-    }
-  } else {
-    console.warn(`No PID found for job ${jobID}, cannot send stop signal`);
+  if (activeAttempt) {
+    await prisma.jobRunAttempt.update({
+      where: { id: activeAttempt.id },
+      data: {
+        status: 'stopping',
+      },
+    });
   }
+
+  stopPid(activeAttempt?.trainer_pid ?? job.pid);
+  stopPid(activeAttempt?.sampler_pid ?? job.sampler_pid);
 
   return NextResponse.json(job);
 }

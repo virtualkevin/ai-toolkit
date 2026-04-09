@@ -4,183 +4,265 @@ import { spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 import { TOOLKIT_ROOT, getTrainingFolder, getHFToken } from '../paths';
+import { claimRunAttempt, finalizeAttempt, updateAttemptHeartbeat } from './attempts';
+import { resolveGpuAssignment } from '../../lib/jobGpu';
+import { getSamplingWorkerSupport } from '../../lib/samplingSupport';
+
 const isWindows = process.platform === 'win32';
 
-const startAndWatchJob = (job: Job) => {
-  // starts and watches the job asynchronously
-  return new Promise<void>(async (resolve, reject) => {
-    const jobID = job.id;
+const rotateLogFile = (trainingFolder: string, logPath: string) => {
+  try {
+    if (!fs.existsSync(logPath)) return;
 
-    // setup the training
+    const logsFolder = path.join(trainingFolder, 'logs');
+    if (!fs.existsSync(logsFolder)) {
+      fs.mkdirSync(logsFolder, { recursive: true });
+    }
+
+    let num = 0;
+    while (fs.existsSync(path.join(logsFolder, `${num}_log.txt`))) {
+      num++;
+    }
+
+    fs.renameSync(logPath, path.join(logsFolder, `${num}_log.txt`));
+  } catch (error) {
+    console.error('Error rotating log file:', error);
+  }
+};
+
+const getPythonPath = () => {
+  let pythonPath = 'python';
+  if (fs.existsSync(path.join(TOOLKIT_ROOT, '.venv'))) {
+    pythonPath = isWindows
+      ? path.join(TOOLKIT_ROOT, '.venv', 'Scripts', 'python.exe')
+      : path.join(TOOLKIT_ROOT, '.venv', 'bin', 'python');
+  } else if (fs.existsSync(path.join(TOOLKIT_ROOT, 'venv'))) {
+    pythonPath = isWindows
+      ? path.join(TOOLKIT_ROOT, 'venv', 'Scripts', 'python.exe')
+      : path.join(TOOLKIT_ROOT, 'venv', 'bin', 'python');
+  }
+  return pythonPath;
+};
+
+const spawnDetachedProcess = (pythonPath: string, args: string[], env: NodeJS.ProcessEnv) => {
+  if (isWindows) {
+    return spawn(pythonPath, args, {
+      env,
+      cwd: TOOLKIT_ROOT,
+      detached: true,
+      windowsHide: true,
+      stdio: 'ignore',
+    });
+  }
+
+  return spawn(pythonPath, args, {
+    env,
+    cwd: TOOLKIT_ROOT,
+    detached: true,
+    stdio: 'ignore',
+  });
+};
+
+const maybeWritePidFile = (trainingFolder: string, name: string, pid: number | null) => {
+  try {
+    fs.writeFileSync(path.join(trainingFolder, name), String(pid ?? ''), { flag: 'w' });
+  } catch (error) {
+    console.error(`Error writing ${name}:`, error);
+  }
+};
+
+const stopSpawnedPid = (pid: number | null | undefined) => {
+  if (pid == null) return;
+  try {
+    if (isWindows) {
+      const { execSync } = require('child_process');
+      execSync(`taskkill /PID ${pid} /T /F`, { stdio: 'ignore' });
+    } else {
+      process.kill(pid, 'SIGINT');
+    }
+  } catch (error) {
+    console.error(`Error stopping spawned PID ${pid}:`, error);
+  }
+};
+
+const startAndWatchJob = (job: Job, attemptId: string) => {
+  return new Promise<boolean>(async resolve => {
     const trainingRoot = await getTrainingFolder();
-
     const trainingFolder = path.join(trainingRoot, job.name);
     if (!fs.existsSync(trainingFolder)) {
       fs.mkdirSync(trainingFolder, { recursive: true });
     }
 
-    // make the config file
     const configPath = path.join(trainingFolder, '.job_config.json');
-
-    //log to path
     const logPath = path.join(trainingFolder, 'log.txt');
+    rotateLogFile(trainingFolder, logPath);
 
-    try {
-      // if the log path exists, move it to a folder called logs and rename it {num}_log.txt, looking for the highest num
-      // if the log path does not exist, create it
-      if (fs.existsSync(logPath)) {
-        const logsFolder = path.join(trainingFolder, 'logs');
-        if (!fs.existsSync(logsFolder)) {
-          fs.mkdirSync(logsFolder, { recursive: true });
-        }
-
-        let num = 0;
-        while (fs.existsSync(path.join(logsFolder, `${num}_log.txt`))) {
-          num++;
-        }
-
-        fs.renameSync(logPath, path.join(logsFolder, `${num}_log.txt`));
-      }
-    } catch (e) {
-      console.error('Error moving log file:', e);
-    }
-
-    // update the config dataset path
     const jobConfig = JSON.parse(job.job_config);
     jobConfig.config.process[0].sqlite_db_path = path.join(TOOLKIT_ROOT, 'aitk_db.db');
 
-    // write the config file
     fs.writeFileSync(configPath, JSON.stringify(jobConfig, null, 2));
 
-    let pythonPath = 'python';
-    // use .venv or venv if it exists
-    if (fs.existsSync(path.join(TOOLKIT_ROOT, '.venv'))) {
-      if (isWindows) {
-        pythonPath = path.join(TOOLKIT_ROOT, '.venv', 'Scripts', 'python.exe');
-      } else {
-        pythonPath = path.join(TOOLKIT_ROOT, '.venv', 'bin', 'python');
-      }
-    } else if (fs.existsSync(path.join(TOOLKIT_ROOT, 'venv'))) {
-      if (isWindows) {
-        pythonPath = path.join(TOOLKIT_ROOT, 'venv', 'Scripts', 'python.exe');
-      } else {
-        pythonPath = path.join(TOOLKIT_ROOT, 'venv', 'bin', 'python');
-      }
-    }
-
+    const assignment = resolveGpuAssignment(job);
+    const pythonPath = getPythonPath();
     const runFilePath = path.join(TOOLKIT_ROOT, 'run.py');
+    const workerFilePath = path.join(TOOLKIT_ROOT, 'run_sampling_worker.py');
+
     if (!fs.existsSync(runFilePath)) {
       console.error(`run.py not found at path: ${runFilePath}`);
-      await prisma.job.update({
-        where: { id: jobID },
-        data: {
-          status: 'error',
-          info: `Error launching job: run.py not found`,
-        },
+      await finalizeAttempt(prisma, attemptId, {
+        attemptStatus: 'error',
+        jobStatus: 'error',
+        info: 'Error launching job: run.py not found',
       });
+      resolve(false);
       return;
     }
 
-    const additionalEnv: any = {
-      AITK_JOB_ID: jobID,
+    const samplingSupport = getSamplingWorkerSupport(jobConfig);
+    const shouldStartSamplingWorker =
+      !assignment.isLegacyMode &&
+      assignment.samplingGpuId != null &&
+      samplingSupport.supported &&
+      fs.existsSync(workerFilePath);
+
+    const additionalEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      AITK_JOB_ID: job.id,
+      AITK_ATTEMPT_ID: attemptId,
+      AITK_USE_DEDICATED_SAMPLER: shouldStartSamplingWorker ? '1' : '0',
       CUDA_DEVICE_ORDER: 'PCI_BUS_ID',
-      CUDA_VISIBLE_DEVICES: `${job.gpu_ids}`,
+      CUDA_VISIBLE_DEVICES: assignment.trainerVisibleGpuIds.join(','),
       IS_AI_TOOLKIT_UI: '1',
     };
 
-    // HF_TOKEN
     const hfToken = await getHFToken();
     if (hfToken && hfToken.trim() !== '') {
       additionalEnv.HF_TOKEN = hfToken;
     }
 
-    // Add the --log argument to the command
-    const args = [runFilePath, configPath, '--log', logPath];
+    let trainerPid: number | null = null;
+    let samplerPid: number | null = null;
 
     try {
-      let subprocess;
+      const trainerArgs = [runFilePath, configPath, '--log', logPath];
+      const trainerProcess = spawnDetachedProcess(pythonPath, trainerArgs, additionalEnv);
+      trainerPid = trainerProcess.pid ?? null;
 
-      if (isWindows) {
-        // Spawn Python directly on Windows so the process can survive parent exit
-        subprocess = spawn(pythonPath, args, {
-          env: {
-            ...process.env,
-            ...additionalEnv,
-          },
-          cwd: TOOLKIT_ROOT,
-          detached: true,
-          windowsHide: true,
-          stdio: 'ignore', // don't tie stdio to parent
-        });
-      } else {
-        // For non-Windows platforms, fully detach and ignore stdio so it survives daemon-like
-        subprocess = spawn(pythonPath, args, {
-          detached: true,
-          stdio: 'ignore',
-          env: {
-            ...process.env,
-            ...additionalEnv,
-          },
-          cwd: TOOLKIT_ROOT,
-        });
-      }
-
-      // Save the PID to the database and a file for future management (stop/inspect)
-      const pid = subprocess.pid ?? null;
-      if (pid != null) {
-        await prisma.job.update({
-          where: { id: jobID },
-          data: { pid },
-        });
-      }
-      try {
-        fs.writeFileSync(path.join(trainingFolder, 'pid.txt'), String(pid ?? ''), { flag: 'w' });
-      } catch (e) {
-        console.error('Error writing pid file:', e);
-      }
-
-      // Important: let the child run independently of this Node process.
-      if (subprocess.unref) {
-        subprocess.unref();
-      }
-
-      // (No stdout/stderr listeners — logging should go to --log handled by your Python)
-      // (No monitoring loop — the whole point is to let it live past this worker)
-    } catch (error: any) {
-      // Handle any exceptions during process launch
-      console.error('Error launching process:', error);
-
-      await prisma.job.update({
-        where: { id: jobID },
+      await prisma.jobRunAttempt.update({
+        where: { id: attemptId },
         data: {
-          status: 'error',
-          info: `Error launching job: ${error?.message || 'Unknown error'}`,
+          trainer_pid: trainerPid,
+          heartbeat_at: new Date(),
+          status: 'running',
         },
       });
-      return;
+
+      await prisma.job.update({
+        where: { id: job.id },
+        data: {
+          pid: trainerPid,
+          status: 'running',
+          info: 'Training',
+        },
+      });
+
+      maybeWritePidFile(trainingFolder, 'pid.txt', trainerPid);
+      if (trainerProcess.unref) trainerProcess.unref();
+
+      if (shouldStartSamplingWorker && assignment.samplingGpuId) {
+        const samplerLogPath = path.join(trainingFolder, 'sampler.log');
+        rotateLogFile(trainingFolder, samplerLogPath);
+
+        const samplerEnv: NodeJS.ProcessEnv = {
+          ...process.env,
+          AITK_JOB_ID: job.id,
+          AITK_ATTEMPT_ID: attemptId,
+          AITK_CONFIG_PATH: configPath,
+          AITK_DB_PATH: path.join(TOOLKIT_ROOT, 'aitk_db.db'),
+          CUDA_DEVICE_ORDER: 'PCI_BUS_ID',
+          CUDA_VISIBLE_DEVICES: assignment.samplingGpuId,
+          IS_AI_TOOLKIT_UI: '1',
+        };
+
+        if (hfToken && hfToken.trim() !== '') {
+          samplerEnv.HF_TOKEN = hfToken;
+        }
+
+        const samplerArgs = [workerFilePath, '--job-id', job.id, '--attempt-id', attemptId, '--log', samplerLogPath];
+        const samplerProcess = spawnDetachedProcess(pythonPath, samplerArgs, samplerEnv);
+        samplerPid = samplerProcess.pid ?? null;
+
+        await prisma.jobRunAttempt.update({
+          where: { id: attemptId },
+          data: {
+            sampler_pid: samplerPid,
+            heartbeat_at: new Date(),
+          },
+        });
+
+        await prisma.job.update({
+          where: { id: job.id },
+          data: {
+            sampler_pid: samplerPid,
+            info: 'Training with dedicated sampling GPU',
+          },
+        });
+
+        maybeWritePidFile(trainingFolder, 'sampler_pid.txt', samplerPid);
+        if (samplerProcess.unref) samplerProcess.unref();
+      } else if (!assignment.isLegacyMode && assignment.samplingGpuId && !samplingSupport.supported) {
+        await prisma.job.update({
+          where: { id: job.id },
+          data: {
+            info: samplingSupport.reason ?? 'Training (sampling will run inline)',
+          },
+        });
+      }
+
+      await updateAttemptHeartbeat(prisma, attemptId);
+      resolve(true);
+    } catch (error: any) {
+      console.error('Error launching process:', error);
+      stopSpawnedPid(samplerPid);
+      stopSpawnedPid(trainerPid);
+      await finalizeAttempt(prisma, attemptId, {
+        attemptStatus: 'error',
+        jobStatus: 'error',
+        info: `Error launching job: ${error?.message || 'Unknown error'}`,
+      });
+      resolve(false);
     }
-    // Resolve the promise immediately after starting the process
-    resolve();
   });
 };
 
 export default async function startJob(jobID: string) {
-  const job: Job | null = await prisma.job.findUnique({
+  const job = await prisma.job.findUnique({
     where: { id: jobID },
   });
+
   if (!job) {
     console.error(`Job with ID ${jobID} not found`);
-    return;
+    return false;
   }
-  // update job status to 'running', this will run sync so we don't start multiple jobs.
-  await prisma.job.update({
-    where: { id: jobID },
-    data: {
-      status: 'running',
-      stop: false,
-      info: 'Starting job...',
-    },
-  });
-  // start and watch the job asynchronously so the cron can continue
-  startAndWatchJob(job);
+
+  try {
+    const attempt = await claimRunAttempt(prisma, job);
+    if (!attempt) {
+      return false;
+    }
+    return startAndWatchJob(job, attempt.id);
+  } catch (error: any) {
+    if (error?.code === 'P2002') {
+      return false;
+    }
+    console.error(`Failed to claim run attempt for job ${jobID}:`, error);
+    await prisma.job.update({
+      where: { id: jobID },
+      data: {
+        status: 'error',
+        info: error?.message || 'Failed to reserve GPUs for job',
+      },
+    });
+    return false;
+  }
 }

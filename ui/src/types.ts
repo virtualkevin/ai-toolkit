@@ -1,3 +1,5 @@
+import type { Job as PrismaJob } from '@prisma/client';
+
 /**
  * GPU API response
  */
@@ -250,6 +252,21 @@ export interface JobConfig {
   job: string;
   config: ConfigObject;
   meta: MetaConfig;
+}
+
+export const NO_SAMPLING_GPU_VALUE = '__none__';
+
+export interface JobGpuAssignmentFields {
+  training_gpu_id: string | null;
+  sampling_gpu_id: string | null;
+}
+
+export type JobWithGpuAssignment = PrismaJob & Partial<JobGpuAssignmentFields>;
+
+export interface JobGpuSelection {
+  training_gpu_id: string | null;
+  sampling_gpu_id: string | null;
+  gpu_ids: string | null;
 }
 
 export interface ConfigDoc {

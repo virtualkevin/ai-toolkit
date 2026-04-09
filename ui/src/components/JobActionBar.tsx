@@ -2,14 +2,19 @@ import Link from 'next/link';
 import { Eye, Trash2, Pen, Play, Pause, Cog, X } from 'lucide-react';
 import { Button } from '@headlessui/react';
 import { openConfirm } from '@/components/ConfirmModal';
-import { Job } from '@prisma/client';
-import { startJob, stopJob, deleteJob, getAvaliableJobActions, markJobAsStopped } from '@/utils/jobs';
+import { JobWithGpuAssignment } from '@/types';
+import {
+  startJob,
+  stopJob,
+  deleteJob,
+  getAvaliableJobActions,
+  markJobAsStopped,
+} from '@/utils/jobs';
 import { startQueue } from '@/utils/queue';
 import { Menu, MenuButton, MenuItem, MenuItems } from '@headlessui/react';
-import { redirect } from 'next/navigation';
 
 interface JobActionBarProps {
-  job: Job;
+  job: JobWithGpuAssignment;
   onRefresh?: () => void;
   afterDelete?: () => void;
   hideView?: boolean;
@@ -38,7 +43,10 @@ export default function JobActionBar({
             await startJob(job.id);
             // start the queue as well
             if (autoStartQueue) {
-              await startQueue(job.gpu_ids);
+              const queueId = job.training_gpu_id ?? job.gpu_ids;
+              if (queueId) {
+                await startQueue(queueId);
+              }
             }
             if (onRefresh) onRefresh();
           }}

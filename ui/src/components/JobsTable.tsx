@@ -2,14 +2,16 @@ import { useMemo } from 'react';
 import useJobsList from '@/hooks/useJobsList';
 import Link from 'next/link';
 import UniversalTable, { TableColumn } from '@/components/UniversalTable';
-import { GpuInfo, JobConfig } from '@/types';
+import { GpuInfo, JobConfig, JobWithGpuAssignment } from '@/types';
 import JobActionBar from './JobActionBar';
-import { Job, Queue } from '@prisma/client';
+import { Queue } from '@prisma/client';
 import useQueueList from '@/hooks/useQueueList';
 import classNames from 'classnames';
 import { startQueue, stopQueue } from '@/utils/queue';
 import { CgSpinner } from 'react-icons/cg';
 import useGPUInfo from '@/hooks/useGPUInfo';
+import { getJobGpuSummary, resolveJobGpuSelection } from '@/utils/jobs';
+import { getQueueTrainingGpuId } from '@/utils/queue';
 
 interface JobsTableProps {
   autoStartQueue?: boolean;
@@ -63,7 +65,22 @@ export default function JobsTable({ onlyActive = false }: JobsTableProps) {
     },
     {
       title: 'GPU',
-      key: 'gpu_ids',
+      key: 'gpu_assignment',
+      render: row => {
+        const summary = getJobGpuSummary(row);
+
+        return (
+          <div className="space-y-1">
+            <div className="text-xs text-gray-300">
+              <span className="text-gray-500">Training:</span> {summary.training}
+            </div>
+            <div className="text-xs text-gray-300">
+              <span className="text-gray-500">Sampling:</span> {summary.sampling}
+            </div>
+            <div className="text-[11px] text-gray-500 break-all">Legacy: {summary.legacy}</div>
+          </div>
+        );
+      },
     },
     {
       title: 'Status',
@@ -95,14 +112,16 @@ export default function JobsTable({ onlyActive = false }: JobsTableProps) {
   const jobsDict = useMemo(() => {
     if (!isGPUInfoLoaded) return {};
     if (jobs.length === 0) return {};
-    let jd: { [key: string]: { name: string; jobs: Job[] } } = {};
+    let jd: { [key: string]: { name: string; jobs: JobWithGpuAssignment[] } } = {};
     gpuList.forEach(gpu => {
       jd[`${gpu.index}`] = { name: `${gpu.name}`, jobs: [] };
     });
     jd['Idle'] = { name: 'Idle', jobs: [] };
     jobs.forEach(job => {
-      const gpu = gpuList.find(gpu => job.gpu_ids?.split(',').includes(gpu.index.toString())) as GpuInfo;
-      const key = `${gpu?.index || '0'}`;
+      const selection = resolveJobGpuSelection(job);
+      const trainingGpuId = selection.training_gpu_id;
+      const gpu = gpuList.find(gpu => `${gpu.index}` === trainingGpuId) as GpuInfo;
+      const key = trainingGpuId && trainingGpuId !== 'mps' ? `${gpu?.index ?? trainingGpuId}` : 'Idle';
       if (['queued', 'running', 'stopping'].includes(job.status) && key in jd) {
         jd[key].jobs.push(job);
       } else {
@@ -125,7 +144,7 @@ export default function JobsTable({ onlyActive = false }: JobsTableProps) {
       }
     });
     return jd;
-  }, [jobs, queues, isGPUInfoLoaded]);
+  }, [jobs, gpuList, isGPUInfoLoaded]);
 
   let isLoading = status === 'loading' || queueStatus === 'loading' || !isGPUInfoLoaded;
 
@@ -138,7 +157,7 @@ export default function JobsTable({ onlyActive = false }: JobsTableProps) {
         .sort()
         .filter(key => key !== 'Idle')
         .map(gpuKey => {
-          const queue = queues.find(q => `${q.gpu_ids}` === gpuKey) as Queue;
+          const queue = queues.find(q => getQueueTrainingGpuId(q.gpu_ids) === gpuKey || `${q.gpu_ids}` === gpuKey) as Queue;
           return (
             <div key={gpuKey} className="mb-6">
               <div
@@ -171,7 +190,7 @@ export default function JobsTable({ onlyActive = false }: JobsTableProps) {
                       <span className="text-red-100 dark:text-red-400 mr-2">Queue Stopped</span>
                       <button
                         onClick={async () => {
-                          await startQueue(gpuKey);
+                          await startQueue((queue?.gpu_ids as string) || gpuKey);
                           refresh();
                         }}
                         className="ml-4 text-xs text-white bg-green-600 hover:bg-green-700 px-2 py-1 rounded"

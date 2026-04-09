@@ -17,6 +17,7 @@
         }
     },
     "include": [
-        "cron/**/*.ts"
+        "cron/**/*.ts",
+        "lib/**/*.ts"
     ]
 }
