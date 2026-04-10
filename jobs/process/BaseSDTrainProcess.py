@@ -73,6 +73,7 @@ import hashlib
 from toolkit.util.blended_blur_noise import get_blended_blur_noise
 from toolkit.util.get_model import get_model_class
 from toolkit.basic import flush
+from toolkit.sampling_status import get_sampling_progress_message
 
 
 class BaseSDTrainProcess(BaseTrainProcess):
@@ -266,6 +267,26 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # override in subclass
         return generate_image_config_list
 
+    def get_sample_config_for_run(self, is_first: bool = False) -> SampleConfig:
+        return self.first_sample_config if is_first else self.sample_config
+
+    def get_sample_item_for_status(self, sample_index: int = 0, is_first: bool = False):
+        sample_config = self.get_sample_config_for_run(is_first=is_first)
+        if sample_config is None or sample_config.samples is None or len(sample_config.samples) == 0:
+            return None
+        bounded_index = min(max(sample_index, 0), len(sample_config.samples) - 1)
+        return sample_config.samples[bounded_index]
+
+    def get_sampling_status_message(
+        self,
+        current: int,
+        total: int,
+        sample_index: int = 0,
+        is_first: bool = False,
+    ) -> str:
+        sample_item = self.get_sample_item_for_status(sample_index=sample_index, is_first=is_first)
+        return get_sampling_progress_message(sample_item, current=current, total=total)
+
     def sample(self, step=None, is_first=False):
         if not self.accelerator.is_main_process:
             return
@@ -273,7 +294,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         sample_folder = os.path.join(self.save_root, 'samples')
         gen_img_config_list = []
 
-        sample_config = self.first_sample_config if is_first else self.sample_config
+        sample_config = self.get_sample_config_for_run(is_first=is_first)
         start_seed = sample_config.seed
         current_seed = start_seed
 

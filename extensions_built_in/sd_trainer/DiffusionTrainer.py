@@ -321,13 +321,21 @@ class DiffusionTrainer(SDTrainer):
         super().sample_step_hook(img_num, total_imgs)
         if self.is_ui_trainer:
             self.maybe_stop()
-            self.update_status(
-                "running", f"Generating images - {img_num + 1}/{total_imgs}")
+            self.update_status("running", self.get_sampling_status_message(
+                current=img_num + 1,
+                total=total_imgs,
+                sample_index=img_num,
+            ))
 
     def sample(self, step=None, is_first=False):
         self.maybe_stop()
-        total_imgs = len(self.sample_config.prompts)
-        self.update_status("running", f"Generating images - 0/{total_imgs}")
+        total_imgs = len(self.get_sample_config_for_run(is_first=is_first).prompts)
+        self.update_status("running", self.get_sampling_status_message(
+            current=0,
+            total=total_imgs,
+            sample_index=0,
+            is_first=is_first,
+        ))
         super().sample(step, is_first)
         self.maybe_stop()
         self.update_status("running", "Training")
