@@ -31,6 +31,30 @@ def get_sampling_status_config(
     return configs[bounded_index]
 
 
+def get_sampling_status_config_for_sources(
+    sample_index: int = 0,
+    generation_configs: Optional[Sequence[Any]] = None,
+    fallback_configs: Optional[Sequence[Any]] = None,
+) -> Optional[Any]:
+    configs_to_use = generation_configs if generation_configs is not None else fallback_configs
+    return get_sampling_status_config(configs_to_use, sample_index=sample_index)
+
+
+def get_sampling_progress_message_for_sources(
+    current: int,
+    total: int,
+    sample_index: int = 0,
+    generation_configs: Optional[Sequence[Any]] = None,
+    fallback_configs: Optional[Sequence[Any]] = None,
+) -> str:
+    status_config = get_sampling_status_config_for_sources(
+        sample_index=sample_index,
+        generation_configs=generation_configs,
+        fallback_configs=fallback_configs,
+    )
+    return get_sampling_progress_message(status_config, current=current, total=total)
+
+
 def get_initial_sampling_progress_desc(configs: Optional[Sequence[Any]]) -> str:
     return get_sampling_progress_desc(get_sampling_status_config(configs, sample_index=0))
 

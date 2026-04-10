@@ -40,6 +40,7 @@ from toolkit.unloader import unload_text_encoder
 from PIL import Image
 from torchvision.transforms import functional as TF
 from toolkit.basic import flush
+from toolkit.sampling_status import get_sampling_progress_message_for_sources
 
 
 adapter_transforms = transforms.Compose([
@@ -112,6 +113,41 @@ class SDTrainer(BaseSDTrainProcess):
 
     def before_model_load(self):
         pass
+
+    def get_sampling_status_message(
+        self,
+        current: int,
+        total: int,
+        sample_index: int = 0,
+        generation_configs=None,
+        fallback_configs=None,
+    ) -> str:
+        if generation_configs is None:
+            generation_configs = self._active_sample_generation_configs
+        if fallback_configs is None:
+            fallback_configs = self.sample_config.samples
+        return get_sampling_progress_message_for_sources(
+            current=current,
+            total=total,
+            sample_index=sample_index,
+            generation_configs=generation_configs,
+            fallback_configs=fallback_configs,
+        )
+
+    def prepare_sampling_status(self, step=None, is_first=False):
+        sample_config, gen_img_config_list = self.build_sample_generate_image_config_list(
+            step=step,
+            is_first=is_first,
+        )
+        total_imgs = len(sample_config.prompts)
+        status_message = self.get_sampling_status_message(
+            current=0,
+            total=total_imgs,
+            sample_index=0,
+            generation_configs=gen_img_config_list,
+            fallback_configs=sample_config.samples,
+        )
+        return sample_config, gen_img_config_list, total_imgs, status_message
     
     def cache_sample_prompts(self):
         if self.train_config.disable_sampling:

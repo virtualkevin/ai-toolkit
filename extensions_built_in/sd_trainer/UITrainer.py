@@ -284,17 +284,11 @@ class UITrainer(SDTrainer):
 
     def sample(self, step=None, is_first=False):
         self.maybe_stop()
-        sample_config, gen_img_config_list = self.build_sample_generate_image_config_list(
+        sample_config, gen_img_config_list, _, status_message = self.prepare_sampling_status(
             step=step,
             is_first=is_first,
         )
-        total_imgs = len(sample_config.prompts)
-        self.update_status("running", self.get_sampling_status_message(
-            current=0,
-            total=total_imgs,
-            sample_index=0,
-            generation_configs=gen_img_config_list,
-        ))
+        self.update_status("running", status_message)
         super().sample(
             step,
             is_first,
