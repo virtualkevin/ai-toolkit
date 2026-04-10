@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 
 def get_sampling_media_noun(config: Optional[Any]) -> str:
@@ -19,3 +19,21 @@ def get_sampling_progress_message(
 
 def get_sampling_progress_desc(config: Optional[Any]) -> str:
     return get_sampling_progress_message(config).title()
+
+
+def get_sampling_status_config(
+    configs: Optional[Sequence[Any]],
+    sample_index: int = 0,
+) -> Optional[Any]:
+    if configs is None or len(configs) == 0:
+        return None
+    bounded_index = min(max(sample_index, 0), len(configs) - 1)
+    return configs[bounded_index]
+
+
+def get_initial_sampling_progress_desc(configs: Optional[Sequence[Any]]) -> str:
+    return get_sampling_progress_desc(get_sampling_status_config(configs, sample_index=0))
+
+
+def update_sampling_progress_desc(progress_bar: Any, config: Optional[Any]) -> None:
+    progress_bar.set_description_str(get_sampling_progress_desc(config))
