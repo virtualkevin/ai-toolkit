@@ -36,6 +36,7 @@ from toolkit.prompt_utils import inject_trigger_into_prompt, PromptEmbeds, conca
 from toolkit.reference_adapter import ReferenceAdapter
 from toolkit.sampler import get_sampler
 from toolkit.samplers.custom_flowmatch_sampler import CustomFlowMatchEulerDiscreteScheduler
+from toolkit.sampling_status import get_initial_sampling_progress_desc, update_sampling_progress_desc
 from toolkit.saving import save_ldm_model_from_diffusers, get_ldm_state_dict_from_diffusers
 from toolkit.sd_device_states_presets import empty_preset
 from toolkit.train_tools import get_torch_dtype, apply_noise_offset
@@ -1371,8 +1372,14 @@ class StableDiffusion:
                 if network is not None:
                     assert network.is_active
 
-                for i in tqdm(range(len(image_configs)), desc=f"Generating Images", leave=False):
+                progress_bar = tqdm(
+                    range(len(image_configs)),
+                    desc=get_initial_sampling_progress_desc(image_configs),
+                    leave=False,
+                )
+                for i in progress_bar:
                     gen_config = image_configs[i]
+                    update_sampling_progress_desc(progress_bar, gen_config)
 
                     extra = {}
                     validation_image = None

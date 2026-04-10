@@ -73,6 +73,7 @@ import hashlib
 from toolkit.util.blended_blur_noise import get_blended_blur_noise
 from toolkit.util.get_model import get_model_class
 from toolkit.basic import flush
+from toolkit.sampling_status import get_sampling_progress_message, get_sampling_status_config
 
 
 class BaseSDTrainProcess(BaseTrainProcess):
@@ -261,19 +262,24 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.current_boundary_index = 0
         self.steps_this_boundary = 0
         self.num_consecutive_oom = 0
+        self._active_sample_generation_configs: Optional[List[GenerateImageConfig]] = None
 
     def post_process_generate_image_config_list(self, generate_image_config_list: List[GenerateImageConfig]):
         # override in subclass
         return generate_image_config_list
 
-    def sample(self, step=None, is_first=False):
-        if not self.accelerator.is_main_process:
-            return
-        flush()
+    def get_sample_config_for_run(self, is_first: bool = False) -> SampleConfig:
+        return self.first_sample_config if is_first else self.sample_config
+
+    def build_sample_generate_image_config_list(
+        self,
+        step=None,
+        is_first: bool = False,
+    ):
         sample_folder = os.path.join(self.save_root, 'samples')
         gen_img_config_list = []
 
-        sample_config = self.first_sample_config if is_first else self.sample_config
+        sample_config = self.get_sample_config_for_run(is_first=is_first)
         start_seed = sample_config.seed
         current_seed = start_seed
 
@@ -293,7 +299,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # zero-pad 9 digits
                 step_num = f"_{str(step).zfill(9)}"
 
-            filename = f"[time]_{step_num}_[count].{self.sample_config.ext}"
+            filename = f"[time]_{step_num}_[count].{sample_config.ext}"
 
             output_path = os.path.join(sample_folder, filename)
 
@@ -318,7 +324,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             extra_args = {}
             if self.adapter_config is not None and self.adapter_config.test_img_path is not None:
                 extra_args['adapter_image_path'] = test_image_paths[i]
-            
+
             sample_item = sample_config.samples[i]
             if sample_item.seed is not None:
                 current_seed = sample_item.seed
@@ -352,6 +358,48 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         # post process
         gen_img_config_list = self.post_process_generate_image_config_list(gen_img_config_list)
+        return sample_config, gen_img_config_list
+
+    def get_sampling_status_config(
+        self,
+        sample_index: int = 0,
+        is_first: bool = False,
+        generation_configs: Optional[List[GenerateImageConfig]] = None,
+    ):
+        configs_to_use = generation_configs
+        if configs_to_use is None:
+            configs_to_use = self._active_sample_generation_configs
+        if configs_to_use is not None:
+            return get_sampling_status_config(configs_to_use, sample_index=sample_index)
+        sample_config = self.get_sample_config_for_run(is_first=is_first)
+        if sample_config is None:
+            return None
+        return get_sampling_status_config(sample_config.samples, sample_index=sample_index)
+
+    def get_sampling_status_message(
+        self,
+        current: int,
+        total: int,
+        sample_index: int = 0,
+        is_first: bool = False,
+        generation_configs: Optional[List[GenerateImageConfig]] = None,
+    ) -> str:
+        status_config = self.get_sampling_status_config(
+            sample_index=sample_index,
+            is_first=is_first,
+            generation_configs=generation_configs,
+        )
+        return get_sampling_progress_message(status_config, current=current, total=total)
+
+    def sample(self, step=None, is_first=False, sample_config=None, gen_img_config_list=None):
+        if not self.accelerator.is_main_process:
+            return
+        flush()
+        if sample_config is None or gen_img_config_list is None:
+            sample_config, gen_img_config_list = self.build_sample_generate_image_config_list(
+                step=step,
+                is_first=is_first,
+            )
 
         # if we have an ema, set it to validation mode
         if self.ema is not None:
@@ -362,7 +410,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.adapter.is_sampling = True
         
         # send to be generated
-        self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
+        self._active_sample_generation_configs = gen_img_config_list
+        try:
+            self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
+        finally:
+            self._active_sample_generation_configs = None
 
         
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
