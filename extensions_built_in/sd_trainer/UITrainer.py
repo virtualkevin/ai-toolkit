@@ -8,6 +8,7 @@ from typing import Literal, Optional
 import threading
 import time
 import signal
+from toolkit.sampling_messages import format_generation_status
 
 AITK_Status = Literal["running", "stopped", "error", "completed"]
 
@@ -276,13 +277,25 @@ class UITrainer(SDTrainer):
     def sample_step_hook(self, img_num, total_imgs):
         super().sample_step_hook(img_num, total_imgs)
         self.maybe_stop()
+        num_frames = self._status_sample_config.samples[img_num].num_frames
         self.update_status(
-            "running", f"Generating images - {img_num + 1}/{total_imgs}")
+            "running",
+            format_generation_status(
+                num_frames=num_frames,
+                current=img_num + 1,
+                total=total_imgs,
+            ),
+        )
 
     def sample(self, step=None, is_first=False):
         self.maybe_stop()
-        total_imgs = len(self.sample_config.prompts)
-        self.update_status("running", f"Generating images - 0/{total_imgs}")
+        self._status_sample_config = self.first_sample_config if is_first else self.sample_config
+        total_imgs = len(self._status_sample_config.prompts)
+        num_frames = max((sample.num_frames for sample in self._status_sample_config.samples), default=1)
+        self.update_status(
+            "running",
+            format_generation_status(num_frames=num_frames, current=0, total=total_imgs),
+        )
         super().sample(step, is_first)
         self.maybe_stop()
         self.update_status("running", "Training")
